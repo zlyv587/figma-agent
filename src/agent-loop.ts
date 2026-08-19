@@ -19,6 +19,7 @@ import type { ToolCallLog } from "./eval.js";
 import type { OutputHandler } from "./output-handler.js";
 import { ConsoleHandler } from "./output-handler.js";
 import { composeSystemPrompt } from "./prompts.js";
+import { manageContext, countMessageTokens } from "./context-manager.js";
 
 export interface LoopOptions {
   maxIterations?: number;
@@ -29,7 +30,8 @@ export interface LoopOptions {
   streaming?: boolean;
   humanLoop?: HumanLoop;
   observability?: Observability;
-  outputHandler?: OutputHandler; // ← 新增：输出处理器
+  outputHandler?: OutputHandler;
+  maxContextTokens?: number; // 上下文窗口大小（超出自动压缩）
 }
 
 export interface LoopResult {
@@ -136,6 +138,16 @@ export async function runAgentLoop(
 
     if (tokensUsed >= maxTokens) { stoppedReason = "token_budget"; break; }
     if (Date.now() - startTime > timeoutMs) { stoppedReason = "timeout"; break; }
+
+    // ─── 上下文窗口管理：超阈值时自动压缩 ───
+    if (options.maxContextTokens) {
+      const cr = await manageContext(messages, llm, { maxTokens: options.maxContextTokens });
+      if (cr.compressed) {
+        await handler.emit({ type: "context_compressed", content: cr.tokensBefore + " -> " + cr.tokensAfter + " tokens" });
+        if (obs && sessionId)
+          obs.logEvent(sessionId, { iteration: iterations, phase: "think", metadata: { compressed: true, tokensBefore: cr.tokensBefore, tokensAfter: cr.tokensAfter } });
+      }
+    }
 
     // ─── Think ───
     await handler.emit({ type: "think_start", iteration: iterations });

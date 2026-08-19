@@ -34,6 +34,7 @@ export interface AgentEvent {
     | "human_pause"      // Human-in-the-Loop 暂停
     | "human_resume"     // 用户确认后恢复
     | "error"            // 错误
+    | "context_compressed"
     | "complete";        // 完成
   iteration?: number;
   content?: string;
@@ -82,6 +83,9 @@ export class ConsoleHandler implements OutputHandler {
         break;
       case "error":
         console.log("❌ " + (e.content || ""));
+        break;
+      case "context_compressed":
+        console.log("\n📦 [Context] 压缩: " + (e.content || ""));
         break;
       case "complete":
         console.log("\n✅ 完成");

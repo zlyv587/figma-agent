@@ -24,6 +24,7 @@ export interface TraceEvent {
   result?: string;
   tokens?: number;
   latencyMs?: number;
+  metadata?: Record<string, any>;
   timestamp: number;
 }
 

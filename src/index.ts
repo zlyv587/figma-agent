@@ -21,6 +21,7 @@ const model = process.env.LLM_MODEL || "gpt-4o";
 const embeddingApiKey = process.env.EMBEDDING_API_KEY || apiKey;
 const embeddingBaseURL = process.env.EMBEDDING_BASE_URL || baseURL;
 const embeddingModel = process.env.EMBEDDING_MODEL || "text-embedding-3-small";
+const maxContextTokens = parseInt(process.env.MAX_CONTEXT_TOKENS || "128000");
 const figmaServerPath = process.env.FIGMA_SERVER_PATH || "../figma-mcp-server/src/index.ts";
 const skillsDir = process.env.SKILLS_DIR || join(process.cwd(), "skills");
 
@@ -119,7 +120,7 @@ async function evalMode() {
     console.log("📝 " + evalCase.query);
     const route = await router.route(evalCase.query);
     const result = await runAgentLoop(llm, mcp, evalCase.query, SYSTEM_PROMPT, {
-      matchedSkills: route.skills, observability: obs, verbose: false,
+      matchedSkills: route.skills, observability: obs, verbose: false, maxContextTokens,
     });
     const er = await evalRunner.evaluate(evalCase, result.answer, result.toolCalls, result.activeSkills);
     results.push(er);
@@ -222,6 +223,7 @@ async function agentMode(query: string, flags: string[]) {
       streaming, humanLoop: human ? new HumanLoop() : undefined,
       observability: observe ? new Observability() : undefined,
       outputHandler: wechat ? new WeChatHandler("user_" + Date.now()) : undefined,
+      maxContextTokens,
     });
     console.log("\n" + "═".repeat(60));
     console.log("📋 结果:\n" + "═".repeat(60));
