@@ -18,6 +18,7 @@ import type { HumanLoop } from "./human-loop.js";
 import type { ToolCallLog } from "./eval.js";
 import type { OutputHandler } from "./output-handler.js";
 import type { SecurityChecker } from "./security.js";
+import { retryWithBackoff, type RetryOptions } from "./retry.js";
 import { ConsoleHandler } from "./output-handler.js";
 import { composeSystemPrompt } from "./prompts.js";
 import { manageContext, countMessageTokens } from "./context-manager.js";
@@ -35,6 +36,8 @@ export interface LoopOptions {
   maxContextTokens?: number;
   initialMessages?: any[]; // 续接历史会话
   securityChecker?: SecurityChecker;
+  /** 工具调用重试配置（默认最多 3 次）*/
+  retryOptions?: RetryOptions;
 }
 
 export interface LoopResult {
@@ -100,11 +103,19 @@ export async function runAgentLoop(
   const {
     maxIterations = 20, maxTokens = 200000, timeoutMs = 180000,
     verbose = true, matchedSkills = [], streaming = false,
-    humanLoop, observability: obs, securityChecker: sec,
+    humanLoop, observability: obs, securityChecker: sec, retryOptions: retryOpts,
   } = options;
 
   // 输出处理器：没传就用 ConsoleHandler
   const handler = options.outputHandler ?? new ConsoleHandler(verbose);
+
+  // 注入 LLM 重试回调：让重试事件走 handler 统一输出
+  if (retryOpts) {
+    llm.setRetryCallback(async (info) => {
+      await handler.emit({ type: "retry", content: info.error.message, metadata: { attempt: info.attempt, delayMs: info.delayMs, kind: info.error.kind } });
+      if (obs && sessionId) obs.logEvent(sessionId, { iteration: 0, phase: "error", result: "Retry #" + info.attempt + " (" + info.error.kind + ") wait " + info.delayMs + "ms" });
+    });
+  }
 
   const composedPrompt = composeSystemPrompt(systemPrompt, matchedSkills);
 
@@ -250,7 +261,14 @@ export async function runAgentLoop(
       await handler.emit({ type: "tool_call", toolName: fnName, toolArgs: fnArgs });
       const actStart = Date.now();
       try {
-        const result = await mcp.callTool(fnName, fnArgs);
+        // 工具调用自动重试（限流/网络抖动时指数退避）
+        const result = await retryWithBackoff(
+          () => mcp.callTool(fnName, fnArgs),
+          { ...retryOpts, onRetry: async (info) => {
+            await handler.emit({ type: "retry", content: "工具 " + fnName + ": " + info.error.message, metadata: { attempt: info.attempt, delayMs: info.delayMs, kind: info.error.kind, toolName: fnName } });
+            if (obs && sessionId) obs.logEvent(sessionId, { iteration: iterations, phase: "error", toolName: fnName, result: "Retry #" + info.attempt + " (" + info.error.kind + ") wait " + info.delayMs + "ms" });
+          } }
+        );
         const resultText = result.content?.map((c: any) => (c.type === "text" ? c.text : JSON.stringify(c))).join("\n") || JSON.stringify(result);
         await handler.emit({ type: "tool_result", toolName: fnName, result: resultText, success: !result.isError });
 

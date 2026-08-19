@@ -36,6 +36,7 @@ export interface AgentEvent {
     | "error"            // 错误
     | "context_compressed"
     | "security_alert"   // 安全告警（注入拦截 / 参数校验失败）
+    | "retry"            // 自动重试（限流/网络抖动后退避重试）
     | "complete";        // 完成
   iteration?: number;
   content?: string;
@@ -86,6 +87,9 @@ export class ConsoleHandler implements OutputHandler {
         console.log("\n🔒 [Security] " + (e.content || ""));
         if (e.metadata?.risk) console.log("   风险等级: " + e.metadata.risk);
         if (e.metadata?.shouldBlock) console.log("   ⛔ 已拦截");
+        break;
+      case "retry":
+        console.log("\n🔄 [Retry] 第 " + e.metadata?.attempt + " 次重试 | " + (e.content || "") + " | 等待 " + e.metadata?.delayMs + "ms");
         break;
       case "error":
         console.log("❌ " + (e.content || ""));
@@ -187,6 +191,9 @@ export class WeChatHandler implements OutputHandler {
       case "security_alert":
         await this.flush();
         await this.send("🔒 安全告警: " + (e.content || ""));
+        break;
+      case "retry":
+        // 微信端不推送每次重试细节，只在最终失败时通知
         break;
       case "error":
         await this.flush();

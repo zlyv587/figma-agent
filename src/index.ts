@@ -16,6 +16,7 @@ import type { EvalResult } from "./eval.js";
 import { WeChatHandler } from "./output-handler.js";
 import { ConversationManager } from "./conversation.js";
 import { SecurityChecker, detectPromptInjection, validateToolArgs, maskSecrets, maskSecretsDeep } from "./security.js";
+import { classifyError, retryWithBackoff, sleep } from "./retry.js";
 
 const apiKey = process.env.OPENAI_API_KEY || process.env.LLM_API_KEY || "";
 const baseURL = process.env.LLM_BASE_URL || undefined;
@@ -131,6 +132,120 @@ async function evalMode() {
   }
   await mcp.disconnect();
   console.log(evalRunner.formatReport(results));
+}
+
+// ─── --retry-test（重试模块测试，无需 API Key）───
+async function retryTestMode() {
+  console.log("\n" + "═".repeat(60));
+  console.log("🔄 Retry 模块测试（无需 API Key）");
+  console.log("═".repeat(60));
+
+  // ── 测试 1：错误分类 ──
+  console.log("\n── 测试 1: 错误分类（classifyError）──");
+  const errorTests = [
+    { err: { status: 429, message: "Rate limit" }, expectKind: "rate_limit", expectRetry: true, label: "429 限流" },
+    { err: { status: 429, headers: { "retry-after": "5" }, message: "Rate limit" }, expectKind: "rate_limit", expectRetry: true, label: "429 带 Retry-After" },
+    { err: { status: 500, message: "Internal error" }, expectKind: "server_error", expectRetry: true, label: "500 服务端错误" },
+    { err: { status: 503, message: "Service unavailable" }, expectKind: "server_error", expectRetry: true, label: "503 服务不可用" },
+    { err: { status: 400, message: "Bad request" }, expectKind: "client_error", expectRetry: false, label: "400 参数错误" },
+    { err: { status: 401, message: "Unauthorized" }, expectKind: "client_error", expectRetry: false, label: "401 未授权" },
+    { err: { code: "ETIMEDOUT", message: "timeout" }, expectKind: "network", expectRetry: true, label: "ETIMEDOUT 超时" },
+    { err: { code: "ECONNRESET", message: "reset" }, expectKind: "network", expectRetry: true, label: "ECONNRESET 断连" },
+    { err: { code: "ECONNREFUSED", message: "refused" }, expectKind: "network", expectRetry: true, label: "ECONNREFUSED 拒绝" },
+    { err: { name: "APITimeoutError", message: "Request timed out" }, expectKind: "network", expectRetry: true, label: "APITimeoutError" },
+    { err: { name: "APIConnectionError", message: "Connection error" }, expectKind: "network", expectRetry: true, label: "APIConnectionError" },
+    { err: new Error("something weird"), expectKind: "unknown", expectRetry: false, label: "未知错误" },
+  ];
+  let pass1 = 0;
+  for (const t of errorTests) {
+    const c = classifyError(t.err);
+    const ok = c.kind === t.expectKind && c.retryable === t.expectRetry;
+    if (ok) pass1++;
+    const mark = ok ? "✅" : "❌";
+    let extra = "";
+    if ((t.err as any)?.headers?.["retry-after"]) extra = " retryAfterMs=" + c.retryAfterMs;
+    console.log("  " + mark + " " + t.label + " -> kind=" + c.kind + " retry=" + c.retryable + extra);
+  }
+  console.log("  结果: " + pass1 + "/" + errorTests.length + " 通过");
+
+  // ── 测试 2：重试后成功 ──
+  console.log("\n── 测试 2: 重试后成功（失败 2 次后第 3 次成功）──");
+  {
+    let calls = 0;
+    const retryEvents: number[] = [];
+    const result = await retryWithBackoff(async () => {
+      calls++;
+      if (calls < 3) throw { status: 500, message: "Server error" };
+      return "success";
+    }, { maxRetries: 3, initialDelayMs: 10, maxDelayMs: 50, jitter: false, onRetry: (info) => retryEvents.push(info.attempt) });
+    const ok = result === "success" && calls === 3 && retryEvents.length === 2 && retryEvents.join(",") === "1,2";
+    const mark = ok ? "✅" : "❌";
+    console.log("  " + mark + " 调用 " + calls + " 次, 重试 " + retryEvents.length + " 次, 结果: " + result);
+    if (!ok) console.log("     期望: calls=3, retries=2, events=[1,2], result=success");
+  }
+
+  // ── 测试 3：不可重试错误直接抛出 ──
+  console.log("\n── 测试 3: 不可重试错误（400 直接抛出，不重试）──");
+  {
+    let calls = 0;
+    let retryCount = 0;
+    let caught = false;
+    try {
+      await retryWithBackoff(async () => {
+        calls++;
+        throw { status: 400, message: "Bad request" };
+      }, { maxRetries: 3, initialDelayMs: 10, onRetry: () => retryCount++ });
+    } catch (err: any) {
+      caught = true;
+    }
+    const ok = caught && calls === 1 && retryCount === 0;
+    const mark = ok ? "✅" : "❌";
+    console.log("  " + mark + " 调用 " + calls + " 次, 重试 " + retryCount + " 次, 抛出: " + caught);
+    if (!ok) console.log("     期望: calls=1, retries=0, caught=true");
+  }
+
+  // ── 测试 4：超过最大重试次数 ──
+  console.log("\n── 测试 4: 超过最大重试次数（maxRetries=2, 总共 3 次）──");
+  {
+    let calls = 0;
+    let retryCount = 0;
+    let caught = false;
+    try {
+      await retryWithBackoff(async () => {
+        calls++;
+        throw { status: 503, message: "Service unavailable" };
+      }, { maxRetries: 2, initialDelayMs: 10, maxDelayMs: 50, jitter: false, onRetry: () => retryCount++ });
+    } catch (err: any) {
+      caught = true;
+    }
+    const ok = caught && calls === 3 && retryCount === 2;
+    const mark = ok ? "✅" : "❌";
+    console.log("  " + mark + " 调用 " + calls + " 次, 重试 " + retryCount + " 次, 抛出: " + caught);
+    if (!ok) console.log("     期望: calls=3, retries=2, caught=true");
+  }
+
+  // ── 测试 5：退避延迟递增 ──
+  console.log("\n── 测试 5: 指数退避延迟递增（base=100ms, x2, 无抖动）──");
+  {
+    const delays: number[] = [];
+    try {
+      await retryWithBackoff(async () => {
+        throw { status: 500, message: "error" };
+      }, { maxRetries: 3, initialDelayMs: 100, maxDelayMs: 1000, backoffMultiplier: 2, jitter: false, onRetry: (info) => delays.push(info.delayMs) });
+    } catch {}
+    // 期望: 100, 200, 400 (2^0*100, 2^1*100, 2^2*100)
+    const ok = delays.length === 3 && delays[0] === 100 && delays[1] === 200 && delays[2] === 400;
+    const mark = ok ? "✅" : "❌";
+    console.log("  " + mark + " 退避序列: " + delays.join("ms, ") + "ms");
+    if (!ok) console.log("     期望: 100, 200, 400");
+  }
+
+  // ── 总结 ──
+  const total = pass1 + 4;
+  const max = errorTests.length + 4;
+  console.log("\n" + "═".repeat(60));
+  console.log("总计: " + total + "/" + max + " 通过 " + (total === max ? "🎉 全部通过" : "⚠️ 有失败"));
+  console.log("═".repeat(60));
 }
 
 // ─── --sec-test（安全功能静态测试，无需 API Key）───
@@ -316,6 +431,7 @@ async function agentMode(query: string, flags: string[], convId?: string) {
       maxContextTokens,
       initialMessages,
       securityChecker: secure ? new SecurityChecker() : undefined,
+      retryOptions: { maxRetries: 3, initialDelayMs: 1000, maxDelayMs: 30000 },
     });
 
     // ─── 保存会话 ───
@@ -335,7 +451,8 @@ async function agentMode(query: string, flags: string[], convId?: string) {
 // ─── CLI ───
 const args = process.argv.slice(2);
 
-if (args.includes("--sec-test")) secTestMode();
+if (args.includes("--retry-test")) retryTestMode().catch(console.error);
+else if (args.includes("--sec-test")) secTestMode();
 else if (args.includes("--route-test")) routeTestMode().catch(console.error);
 else if (args.includes("--list-skills")) listSkillsMode().catch(console.error);
 else if (args.includes("--list-tools")) listToolsMode().catch(console.error);
@@ -383,7 +500,8 @@ else {
     console.log("  npx tsx src/index.ts --traces          # 📡 trace 列表");
     console.log("  npx tsx src/index.ts --stats          # 📈 统计");
     console.log("\n其他:");
-    console.log("  npx tsx src/index.ts --sec-test        # 🔒 安全测试（无需 Key）");
+    console.log("  npx tsx src/index.ts --retry-test      # 🔄 重试测试（无需 Key）");
+  console.log("  npx tsx src/index.ts --sec-test        # 🔒 安全测试（无需 Key）");
   console.log("  npx tsx src/index.ts --route-test      # 🔬 路由测试");
     console.log("  npx tsx src/index.ts --list-skills     # 技能列表");
     console.log("  npx tsx src/index.ts --list-tools      # MCP 工具");
