@@ -17,6 +17,7 @@ import type { Observability } from "./observability.js";
 import type { HumanLoop } from "./human-loop.js";
 import type { ToolCallLog } from "./eval.js";
 import type { OutputHandler } from "./output-handler.js";
+import type { SecurityChecker } from "./security.js";
 import { ConsoleHandler } from "./output-handler.js";
 import { composeSystemPrompt } from "./prompts.js";
 import { manageContext, countMessageTokens } from "./context-manager.js";
@@ -31,7 +32,9 @@ export interface LoopOptions {
   humanLoop?: HumanLoop;
   observability?: Observability;
   outputHandler?: OutputHandler;
-  maxContextTokens?: number; // 上下文窗口大小（超出自动压缩）
+  maxContextTokens?: number;
+  initialMessages?: any[]; // 续接历史会话
+  securityChecker?: SecurityChecker;
 }
 
 export interface LoopResult {
@@ -40,9 +43,10 @@ export interface LoopResult {
   tokensUsed: number;
   elapsedMs: number;
   toolCalls: ToolCallLog[];
-  stoppedReason: "completed" | "max_iterations" | "token_budget" | "timeout";
+  stoppedReason: "completed" | "max_iterations" | "token_budget" | "timeout" | "security_blocked";
   activeSkills: string[];
   sessionId?: string;
+  messages: any[];
 }
 
 // ─── 流式 Think：文本通过 handler.emit 发送 ───
@@ -96,7 +100,7 @@ export async function runAgentLoop(
   const {
     maxIterations = 20, maxTokens = 200000, timeoutMs = 180000,
     verbose = true, matchedSkills = [], streaming = false,
-    humanLoop, observability: obs,
+    humanLoop, observability: obs, securityChecker: sec,
   } = options;
 
   // 输出处理器：没传就用 ConsoleHandler
@@ -115,6 +119,9 @@ export async function runAgentLoop(
     if (names.length) llmTools = llmTools.filter((t) => names.includes(t.function.name));
   }
 
+  // 工具参数 Schema 映射（用于安全校验 LLM 生成的参数）
+  const toolSchemaMap = new Map(mcpTools.map((t) => [t.name, t.inputSchema]));
+
   // ─── 可观测性 ───
   let sessionId: string | undefined;
   if (obs) {
@@ -122,15 +129,39 @@ export async function runAgentLoop(
     await handler.emit({ type: "session_start", sessionId });
   }
 
-  const messages: any[] = [
-    { role: "system", content: composedPrompt },
-    { role: "user", content: userQuery },
-  ];
+  const messages: any[] = options.initialMessages
+    ? [
+        { role: "system", content: composedPrompt },
+        ...options.initialMessages.slice(1),
+        { role: "user", content: userQuery },
+      ]
+    : [
+        { role: "system", content: composedPrompt },
+        { role: "user", content: userQuery },
+      ];
 
   let iterations = 0, tokensUsed = 0;
   const startTime = Date.now();
   const toolCallLog: ToolCallLog[] = [];
   let stoppedReason: LoopResult["stoppedReason"] = "max_iterations";
+
+  // ─── 安全检测（第一道防线）：Prompt 注入 ───
+  if (sec) {
+    const inj = sec.checkInjection(userQuery);
+    if (inj.shouldBlock) {
+      const names = inj.matchedRules.map((r) => r.name).join(", ");
+      await handler.emit({ type: "security_alert", content: "检测到 Prompt 注入（" + names + "），已拦截", metadata: { risk: inj.risk, shouldBlock: true } });
+      if (obs && sessionId) obs.logEvent(sessionId, { iteration: 0, phase: "error", result: "Security: 注入拦截 (" + names + ")" });
+      stoppedReason = "security_blocked";
+      if (obs && sessionId) obs.endSession(sessionId, { status: stoppedReason, totalTokens: 0, totalIterations: 0 });
+      return { answer: "⛔ 请求已被安全防护拦截：检测到潜在的 Prompt 注入攻击。", iterations: 0, tokensUsed: 0, elapsedMs: Date.now() - startTime, toolCalls: [], stoppedReason, activeSkills: matchedSkills.map((s) => s.name), sessionId, messages };
+    }
+    if (inj.detected) {
+      const names = inj.matchedRules.map((r) => r.name).join(", ");
+      await handler.emit({ type: "security_alert", content: "检测到可疑模式（" + names + "），已标记但继续处理", metadata: { risk: inj.risk, shouldBlock: false } });
+      if (obs && sessionId) obs.logEvent(sessionId, { iteration: 0, phase: "error", result: "Security: 可疑模式 (" + names + ")" });
+    }
+  }
 
   // ═════════════ 核心循环 ═════════════
   while (iterations < maxIterations) {
@@ -185,12 +216,25 @@ export async function runAgentLoop(
       let fnArgs: Record<string, any>;
       try { fnArgs = JSON.parse(tc.function.arguments); } catch { fnArgs = {}; }
 
+      // ── 安全检测：工具参数校验 ──
+      if (sec) {
+        const schema = toolSchemaMap.get(fnName);
+        const vr = sec.checkToolArgs(fnArgs, schema);
+        if (!vr.valid) {
+          const msg = "参数校验失败: " + vr.errors.join("; ");
+          await handler.emit({ type: "security_alert", content: msg, toolName: fnName, metadata: { risk: "medium", shouldBlock: false } });
+          if (obs && sessionId) obs.logEvent(sessionId, { iteration: iterations, phase: "error", toolName: fnName, result: "Security: " + msg });
+          messages.push({ role: "tool", tool_call_id: tc.id, content: "❌ 参数校验失败，请修正后重试: " + vr.errors.join("; ") });
+          continue;
+        }
+      }
+
       // ── Human-in-the-Loop ──
       if (humanLoop) {
         const risk = humanLoop.isRisky(fnName, fnArgs);
         if (risk.risky) {
           await handler.emit({ type: "human_pause", toolName: fnName, toolArgs: fnArgs });
-          if (obs && sessionId) obs.logEvent(sessionId, { iteration: iterations, phase: "human_pause", toolName: fnName, toolArgs: fnArgs });
+          if (obs && sessionId) obs.logEvent(sessionId, { iteration: iterations, phase: "human_pause", toolName: fnName, toolArgs: sec ? sec.maskDeep(fnArgs) : fnArgs });
           const conf = await humanLoop.confirm(fnName, fnArgs, risk.reason!);
           await handler.emit({ type: "human_resume", toolName: fnName, success: conf.approved });
           if (obs && sessionId) obs.logEvent(sessionId, { iteration: iterations, phase: "human_resume", toolName: fnName });
@@ -211,8 +255,10 @@ export async function runAgentLoop(
         await handler.emit({ type: "tool_result", toolName: fnName, result: resultText, success: !result.isError });
 
         if (obs && sessionId) {
-          obs.logEvent(sessionId, { iteration: iterations, phase: "act", toolName: fnName, toolArgs: fnArgs, latencyMs: Date.now() - actStart });
-          obs.logEvent(sessionId, { iteration: iterations, phase: "observe", toolName: fnName, result: resultText.substring(0, 500) });
+          const maskedArgs = sec ? sec.maskDeep(fnArgs) : fnArgs;
+          const maskedResult = sec ? sec.mask(resultText).substring(0, 500) : resultText.substring(0, 500);
+          obs.logEvent(sessionId, { iteration: iterations, phase: "act", toolName: fnName, toolArgs: maskedArgs, latencyMs: Date.now() - actStart });
+          obs.logEvent(sessionId, { iteration: iterations, phase: "observe", toolName: fnName, result: maskedResult });
         }
 
         toolCallLog.push({ name: fnName, args: fnArgs, result: resultText, success: !result.isError });
@@ -234,6 +280,6 @@ export async function runAgentLoop(
     answer: typeof last?.content === "string" ? last.content : "未完成任务",
     iterations, tokensUsed, elapsedMs: Date.now() - startTime,
     toolCalls: toolCallLog, stoppedReason,
-    activeSkills: matchedSkills.map((s) => s.name), sessionId,
+    activeSkills: matchedSkills.map((s) => s.name), sessionId, messages,
   };
 }

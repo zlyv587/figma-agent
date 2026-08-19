@@ -35,6 +35,7 @@ export interface AgentEvent {
     | "human_resume"     // 用户确认后恢复
     | "error"            // 错误
     | "context_compressed"
+    | "security_alert"   // 安全告警（注入拦截 / 参数校验失败）
     | "complete";        // 完成
   iteration?: number;
   content?: string;
@@ -80,6 +81,11 @@ export class ConsoleHandler implements OutputHandler {
         break;
       case "human_resume":
         console.log("   " + (e.success ? "✅ 已批准" : "❌ 已拒绝"));
+        break;
+      case "security_alert":
+        console.log("\n🔒 [Security] " + (e.content || ""));
+        if (e.metadata?.risk) console.log("   风险等级: " + e.metadata.risk);
+        if (e.metadata?.shouldBlock) console.log("   ⛔ 已拦截");
         break;
       case "error":
         console.log("❌ " + (e.content || ""));
@@ -178,6 +184,10 @@ export class WeChatHandler implements OutputHandler {
         await this.send("✅ 处理完成");
         break;
 
+      case "security_alert":
+        await this.flush();
+        await this.send("🔒 安全告警: " + (e.content || ""));
+        break;
       case "error":
         await this.flush();
         await this.send("❌ 出错了: " + e.content);
