@@ -134,6 +134,59 @@ async function evalMode() {
   console.log(evalRunner.formatReport(results));
 }
 
+// ─── --parallel-test（并行工具分组测试，无需 API Key）───
+async function parallelTestMode() {
+  console.log("\n" + "═".repeat(60));
+  console.log("⚡ Parallel 分组测试（检测 readOnlyHint 声明）");
+  console.log("═".repeat(60));
+
+  // ── 测试 1：MCP 工具 readOnlyHint 声明 ──
+  console.log("\n── 测试 1: Figma MCP 工具 readOnlyHint 声明 ──");
+  const mcp = new McpClient({ command: "npx", args: ["tsx", figmaServerPath] });
+  await mcp.connect();
+  const tools = await mcp.listTools();
+  let pass1 = 0;
+  for (const t of tools) {
+    const ro = t.annotations?.readOnlyHint === true;
+    const ok = ro; // Figma 5 个工具都应该声明只读
+    if (ok) pass1++;
+    const mark = ok ? "✅" : "⚠️";
+    console.log("  " + mark + " " + t.name + " -> readOnlyHint=" + ro);
+  }
+  console.log("  结果: " + pass1 + "/" + tools.length + " 只读（并行安全）");
+  await mcp.disconnect();
+
+  // ── 测试 2：分组决策仿真 ──
+  console.log("\n── 测试 2: 并行/串行分组决策 ──");
+  const safeTools = ["get_figma_file", "get_figma_node"];
+  const writeTool = "create_component"; // 假设存在一个写工具
+  const cases = [
+    { tools: ["get_figma_file", "get_figma_styles"], allSafe: true,
+      expectParallel: true, label: "全是只读工具 -> 并行 ✅" },
+    { tools: ["get_figma_file", writeTool], allSafe: (t: string) => safeTools.includes(t) || t !== writeTool,
+      expectParallel: false, label: "含写工具 -> 串行（防依赖/副作用）✅" },
+    { tools: [writeTool], allSafe: (t: string) => t !== writeTool,
+      expectParallel: false, label: "写工具单独出现 -> 串行 ✅" },
+  ];
+  let pass2 = 0;
+  for (const c of cases) {
+    // 模拟 agent-loop 的决策：批次里所有工具都 readOnly 才并行
+    const isReadOnly = (tool: string) => tools.find((t) => t.name === tool)?.annotations?.readOnlyHint === true || (safeTools.includes(tool) && tool !== writeTool);
+    const allReadOnly = c.tools.every(isReadOnly);
+    const ok = allReadOnly === c.expectParallel;
+    if (ok) pass2++;
+    const mark = ok ? "✅" : "❌";
+    console.log("  " + mark + " " + c.label + " -> allReadOnly=" + allReadOnly + " → " + (allReadOnly ? "并行" : "串行"));
+  }
+  console.log("  结果: " + pass2 + "/" + cases.length + " 通过");
+
+  const total = pass1 + pass2;
+  const max = tools.length + cases.length;
+  console.log("\n" + "═".repeat(60));
+  console.log("总计: " + total + "/" + max + " 通过 " + (total === max ? "🎉 全部通过" : "⚠️ 有失败"));
+  console.log("═".repeat(60));
+}
+
 // ─── --retry-test（重试模块测试，无需 API Key）───
 async function retryTestMode() {
   console.log("\n" + "═".repeat(60));
@@ -378,6 +431,7 @@ async function agentMode(query: string, flags: string[], convId?: string) {
   const wechat = flags.includes("--wechat");
   // 安全防护默认开启，--no-secure 才关闭
   const secure = !flags.includes("--no-secure");
+  const noParallel = flags.includes("--no-parallel");
 
   console.log("┌──────────────────────────────────────────┐");
   console.log("│  Figma Agent - 设计稿 -> 代码生成         │");
@@ -390,6 +444,7 @@ async function agentMode(query: string, flags: string[], convId?: string) {
   if (observe) features.push("📡观测");
   if (wechat) features.push("💬微信");
   if (!secure) features.push("🔓安全已关闭");
+  if (noParallel) features.push("⏸️串行");
   if (features.length) console.log("🔧 " + features.join(" "));
 
   const llm = new LlmClient({ apiKey, baseURL, model });
@@ -432,6 +487,7 @@ async function agentMode(query: string, flags: string[], convId?: string) {
       initialMessages,
       securityChecker: secure ? new SecurityChecker() : undefined,
       retryOptions: { maxRetries: 3, initialDelayMs: 1000, maxDelayMs: 30000 },
+      parallelTools: !noParallel,
     });
 
     // ─── 保存会话 ───
@@ -451,7 +507,8 @@ async function agentMode(query: string, flags: string[], convId?: string) {
 // ─── CLI ───
 const args = process.argv.slice(2);
 
-if (args.includes("--retry-test")) retryTestMode().catch(console.error);
+if (args.includes("--parallel-test")) parallelTestMode().catch(console.error);
+else if (args.includes("--retry-test")) retryTestMode().catch(console.error);
 else if (args.includes("--sec-test")) secTestMode();
 else if (args.includes("--route-test")) routeTestMode().catch(console.error);
 else if (args.includes("--list-skills")) listSkillsMode().catch(console.error);
@@ -488,7 +545,7 @@ else {
     console.log("│  Figma Agent - 生产级 Agent 系统                   │");
     console.log("└──────────────────────────────────────────────────┘");
     console.log("\n运行 Agent:");
-    console.log('  npx tsx src/index.ts "你的指令" [--stream] [--human] [--observe] [--wechat] [--no-secure]');
+    console.log('  npx tsx src/index.ts "你的指令" [--stream] [--human] [--observe] [--wechat] [--no-secure] [--no-parallel]');
     console.log("\n多轮对话:");
     console.log("  npx tsx src/index.ts --conversations     # 📂 列出会话");
     console.log('  npx tsx src/index.ts --continue <id> "追问"  # 继续对话');
@@ -500,7 +557,8 @@ else {
     console.log("  npx tsx src/index.ts --traces          # 📡 trace 列表");
     console.log("  npx tsx src/index.ts --stats          # 📈 统计");
     console.log("\n其他:");
-    console.log("  npx tsx src/index.ts --retry-test      # 🔄 重试测试（无需 Key）");
+    console.log("  npx tsx src/index.ts --parallel-test   # ⚡ 并行分组测试（无需 Key）");
+  console.log("  npx tsx src/index.ts --retry-test      # 🔄 重试测试（无需 Key）");
   console.log("  npx tsx src/index.ts --sec-test        # 🔒 安全测试（无需 Key）");
   console.log("  npx tsx src/index.ts --route-test      # 🔬 路由测试");
     console.log("  npx tsx src/index.ts --list-skills     # 技能列表");

@@ -37,6 +37,9 @@ export interface AgentEvent {
     | "context_compressed"
     | "security_alert"   // 安全告警（注入拦截 / 参数校验失败）
     | "retry"            // 自动重试（限流/网络抖动后退避重试）
+    | "parallel_start"  // 并行工具执行开始
+    | "parallel_done"   // 并行工具执行完成
+    | "parallel_skip"   // 回退串行（存在依赖/非只读工具）
     | "complete";        // 完成
   iteration?: number;
   content?: string;
@@ -90,6 +93,15 @@ export class ConsoleHandler implements OutputHandler {
         break;
       case "retry":
         console.log("\n🔄 [Retry] 第 " + e.metadata?.attempt + " 次重试 | " + (e.content || "") + " | 等待 " + e.metadata?.delayMs + "ms");
+        break;
+      case "parallel_skip":
+        console.log("\n⏸️ [Parallel] " + (e.metadata?.reason || "回退串行执行"));
+        break;
+      case "parallel_start":
+        console.log("\n⚡ [Parallel] 并行执行 " + e.metadata?.count + " 个工具...");
+        break;
+      case "parallel_done":
+        console.log("\n⚡ [Parallel] 完成 | 并行 " + e.metadata?.parallelMs + "ms vs 串行 " + e.metadata?.sequentialMs + "ms | 加速 " + e.metadata?.speedup + "x");
         break;
       case "error":
         console.log("❌ " + (e.content || ""));
@@ -194,6 +206,11 @@ export class WeChatHandler implements OutputHandler {
         break;
       case "retry":
         // 微信端不推送每次重试细节，只在最终失败时通知
+        break;
+      case "parallel_start":
+        // 微信端不推送并行细节
+        break;
+      case "parallel_done":
         break;
       case "error":
         await this.flush();
